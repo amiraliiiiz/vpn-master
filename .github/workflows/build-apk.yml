@@ -1,10 +1,11 @@
 name: Build VPN Master APK
 
-# ساخت APK امضاشده در فضای ابری گیت‌هاب — نیازی به نصب چیزی روی کامپیوتر نیست.
+# ساخت APK امضاشده در فضای ابری گیت‌هاب.
 # اجرا: تب Actions → Build VPN Master APK → Run workflow
 #
-# این Workflow دقیقاً از همان زنجیرهٔ ابزار CI رسمی sing-box استفاده می‌کند:
-#   Go 1.26.10 · NDK r28 · JDK 17 · Gradle Wrapper خودِ پروژه
+# نکتهٔ مهم (نسخهٔ ۲): جاوا باید **قبل** از Android SDK نصب شود، چون sdkmanager
+# به جاوا نیاز دارد؛ و اگر اکشن رسمی SDK به هر دلیلی کار نکند، از SDK
+# از پیش نصب‌شدهٔ رانر گیت‌هاب استفاده می‌کنیم تا بیلد متوقف نشود.
 
 on:
   workflow_dispatch:
@@ -19,7 +20,6 @@ on:
 env:
   GO_VERSION: "1.26.10"
   SING_BOX_REF: ${{ github.event.inputs.sing_box_ref || 'testing' }}
-  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx6g -Dfile.encoding=UTF-8"
 
 jobs:
   apk:
@@ -28,8 +28,8 @@ jobs:
     timeout-minutes: 300
 
     steps:
-      # ۱) سورس اپ. پوشهٔ checkout عمداً «sing-box-for-android» نامیده شده،
-      #    چون ابزار ساخت libbox خروجی AAR را خودش در ../sing-box-for-android/app/libs کپی می‌کند.
+      # ۱) سورس اپ. نام پوشه عمداً «sing-box-for-android» است، چون ابزار ساخت
+      #    libbox خروجی AAR را خودش در ../sing-box-for-android/app/libs کپی می‌کند.
       - name: Checkout VPN Master
         uses: actions/checkout@v4
         with:
@@ -38,12 +38,18 @@ jobs:
       - name: Prepare libs dir
         run: mkdir -p sing-box-for-android/app/libs
 
-      # ۲) ابزارها — همان نسخه‌هایی که خود sing-box در CI استفاده می‌کند
-      - name: Set up Go ${{ env.GO_VERSION }}
-        uses: actions/setup-go@v5
+      # ۲) جاوا اول از همه — ابزارهای SDK و ساخت هسته به آن نیاز دارند
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          go-version: "${{ env.GO_VERSION }}"
-          cache: false
+          distribution: temurin
+          java-version: "17"
+
+      # ۳) Android SDK — اگر این اکشن مشکل داشت، بیلد ادامه می‌دهد
+      - name: Set up Android SDK
+        id: setup-sdk
+        continue-on-error: true
+        uses: android-actions/setup-android@v3
 
       - name: Set up Android NDK r28
         id: setup-ndk
@@ -51,24 +57,40 @@ jobs:
         with:
           ndk-version: r28
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      # ۴) Go برای کامپایل هستهٔ VPN
+      - name: Set up Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
         with:
-          distribution: temurin
-          java-version: "17"
+          go-version: "${{ env.GO_VERSION }}"
+          cache: false
 
-      - name: Accept licenses & env
+      # ۵) تعیین مسیرهای SDK/NDK + تضمین وجود فایل لایسنس
+      #    (ابزار ساخت libbox نیاز دارد $ANDROID_HOME/licenses/android-sdk-license موجود باشد)
+      - name: Resolve Android SDK & NDK paths
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          set -eux
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=${ANDROID_SDK_ROOT:-$ANDROID_HOME}" >> "$GITHUB_ENV"
+          mkdir -p "$SDK/licenses"
+          if [ ! -f "$SDK/licenses/android-sdk-license" ]; then
+            printf '\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n84831b9409646a918e30573bab4c9c91346d8abd\n' \
+              > "$SDK/licenses/android-sdk-license"
+          fi
+          echo "SDK=$SDK"
+          ls "$SDK" || true
+          ls "$SDK/licenses"
+          if command -v sdkmanager >/dev/null 2>&1; then
+            yes | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager --version || true
+          else
+            echo "sdkmanager در PATH نیست — از SDK از پیش نصب‌شده استفاده می‌شود"
+          fi
           java -version
           go version
 
-      # ۳) cache ماژول‌های Go — اجراهای بعدی چند دقیقه سریع‌تر
+      # ۶) cache ماژول‌های Go
       - name: Cache Go modules
         uses: actions/cache@v4
         with:
@@ -78,7 +100,7 @@ jobs:
           key: go-${{ env.GO_VERSION }}-${{ github.run_id }}
           restore-keys: go-${{ env.GO_VERSION }}-
 
-      # ۴) ساخت هستهٔ واقعی VPN (libbox.aar) از سورس sing-box
+      # ۷) ساخت هستهٔ واقعی VPN (libbox.aar) از سورس sing-box
       - name: Build libbox.aar from sing-box source
         run: |
           set -eux
@@ -86,11 +108,11 @@ jobs:
           cd sb
           make lib_install                      # نصب gomobile + gobind
           export PATH="$PATH:$(go env GOPATH)/bin"
-          make lib_android                      # خروجی: libbox.aar و libbox-legacy.aar (۴ معماری)
+          make lib_android                      # خروجی: libbox.aar و libbox-legacy.aar
           ls -la libbox*.aar
           ls -la ../sing-box-for-android/app/libs
 
-      # ۵) کلید امضا — اگر Secret نگذاشته باشی، کلید آزمایشی ساخته می‌شود
+      # ۸) کلید امضا (اگر Secret نگذاشته باشی، کلید آزمایشی ساخته می‌شود)
       - name: Prepare signing key
         env:
           K_B64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -105,7 +127,6 @@ jobs:
           APASS="${K_ALIAS_PASS:-$PASS}"
           if [ -n "${K_B64:-}" ]; then
             echo "$K_B64" | base64 -d > "$KS"
-            echo "استفاده از کلید موجود در Secrets"
           else
             keytool -genkeypair -v -keystore "$KS" -storetype PKCS12 -alias "$ALIAS" \
               -storepass "$PASS" -keypass "$APASS" -keyalg RSA -keysize 4096 -validity 10950 \
@@ -114,7 +135,7 @@ jobs:
           printf 'KEYSTORE_PASS=%s\nALIAS_NAME=%s\nALIAS_PASS=%s\n' "$PASS" "$ALIAS" "$APASS" > local.properties
           echo "LOCAL_PROPERTIES=$(base64 -w0 local.properties)" >> "$GITHUB_ENV"
 
-      # ۶) کامپایل اپ
+      # ۹) کامپایل اپ
       - name: Build APK (assembleOtherRelease)
         working-directory: sing-box-for-android
         run: |
@@ -123,13 +144,13 @@ jobs:
           echo "android.builder.sdkDownload=true" >> gradle.properties
           ./gradlew --no-daemon --stacktrace --warning-mode=summary :app:assembleOtherRelease
 
-      # ۷) بررسی امضا + خلاصه در صفحهٔ اجرا
+      # ۱۰) بررسی امضا + خلاصه در صفحهٔ اجرا
       - name: Verify & summarize
         run: |
           set -eux
           APKDIR=sing-box-for-android/app/build/outputs/apk/other/release
           ls -la "$APKDIR"
-          BT=$(ls -d "$ANDROID_SDK_ROOT"/build-tools/* 2>/dev/null | sort -V | tail -1 || true)
+          BT=$(ls -d "${ANDROID_SDK_ROOT}"/build-tools/* 2>/dev/null | sort -V | tail -1 || true)
           for f in "$APKDIR"/*.apk; do
             echo "--- $f"
             [ -n "$BT" ] && "$BT/apksigner" verify --print-certs "$f" || true
@@ -144,7 +165,7 @@ jobs:
             echo "🔸 برای بیشتر گوشی‌ها \`arm64-v8a\` (یا \`universal\`) را نصب کن."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ۸) آپلود خروجی
+      # ۱۱) آپلود خروجی
       - name: Upload APK artifacts
         uses: actions/upload-artifact@v4
         with:
